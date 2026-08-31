@@ -392,6 +392,30 @@ function buildTimeline(kelivoMessages, tsDB) {
 }
 
 // ========================
+// 兜底补时间戳（治本唤醒误判）
+// ========================
+// 批注 2026-08-31：wake_up.js 从 user 消息内容里挖英文数字格式时间戳
+// （YYYY-MM-DD HH:mm）来定位"最后一条用户消息"。RikkaHub 注入的是中文日期
+// （2026年8月31日），它认不出，且该注入时有时无；一旦认不出最新那条 user
+// 消息的时间，它就会回退到更早消息，把"最后活动时间"算错 → 误触发唤醒。
+// 这里在时间线存盘前，用服务器当前时刻给最新一条 user 消息补一个英文时间戳
+// 前缀，保证 wake_up 永远认得出最新锚点。只改存进时间线的副本，不影响发给
+// 模型的内容。
+function ensureLastUserHasTimestamp(messages, now = new Date()) {
+  // 与 wake_up.js parseTimelineTimestamp 等价的可解析判定
+  const tsRegex = /（?\s*\d{4}([-/])\d{1,2}\1\d{1,2}(?:[ T]?)\d{1,2}[:：]\d{2}/;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    const text = normalizeContentToText(m.content);
+    if (tsRegex.test(text)) break; // 已带可解析时间戳，无需补
+    // 不含 → 补一个英文时间戳前缀，作为 wake_up 的最新锚点
+    m.content = `${formatDateTimeInTimeZone(now, TIME_ZONE)} ${text}`.trim();
+    break;
+  }
+}
+
+// ========================
 // 追加特殊事件
 // ========================
 function appendSpecialEvent(content) {
@@ -585,6 +609,8 @@ app.post("/v1/chat/completions", async (req, reply) => {
     if (tsDBDirty) saveTimestampDB(tsDB);
 
     const finalTimeline = buildTimeline(kelivoMessages, tsDB);
+    // 批注 2026-08-31：存盘前给最新 user 消息兜底补英文时间戳，治本唤醒误判。
+    ensureLastUserHasTimestamp(finalTimeline);
     saveTimeline(finalTimeline);
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
