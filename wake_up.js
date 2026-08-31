@@ -480,6 +480,21 @@ ${historyText}`
     return;
   }
 
+  const requestBody = {
+    model: process.env.MODEL_NAME,
+    messages: wakeMessages,
+    temperature: 0.8,
+    top_p: 0.95,
+    stream: false
+  };
+
+  // 批注 2026-08-31：唤醒/日记路径默认开启思考——请求不带 tools，
+  // 无需回传 reasoning_content，开思考能让"我"保有自我连续性、认得出自己写的东西。
+  // 想让它退回纯机械填充，可设 WAKE_REASONING=off。
+  if ((process.env.WAKE_REASONING || "on").trim().toLowerCase() === "off") {
+    requestBody.thinking = { type: "disabled" };
+  }
+
   const response = await fetch(process.env.TARGET_API_URL, {
     method: "POST",
     // 批注 2026-08-10：上游只建连不结束时，旧循环永远不会安排下一次检查；
@@ -489,13 +504,7 @@ ${historyText}`
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.TARGET_API_KEY}`
     },
-    body: JSON.stringify({
-      model: process.env.MODEL_NAME,
-      messages: wakeMessages,
-      temperature: 0.8,
-      top_p: 0.95,
-      stream: false
-    })
+    body: JSON.stringify(requestBody)
   });
 
   const responseText = await response.text();

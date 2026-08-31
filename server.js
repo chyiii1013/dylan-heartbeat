@@ -710,6 +710,17 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     const requestedStream = body?.stream === true;
 
+    const requestBody = { ...body, messages: llmMessages };
+
+    // 批注 2026-08-31：网关聊天路径默认关闭 DeepSeek 思考模式。
+    // RikkaHub 聊天/工具调用会携带 tools，思考模式下 DeepSeek 强制要求回传
+    // reasoning_content，而 RikkaHub 不回传 → 报 400、消息发不出去。
+    // 需要网关聊天也思考时可设 GATEWAY_CHAT_REASONING=on
+    // （届时工具调用可能因 reasoning_content 未回传而报错）。
+    if ((process.env.GATEWAY_CHAT_REASONING || "off").trim().toLowerCase() === "off") {
+      requestBody.thinking = { type: "disabled" };
+    }
+
     // 请求模型
     const response = await fetch(TARGET_API_URL, {
       method: "POST",
@@ -717,7 +728,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
         "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.TARGET_API_KEY}`
       },
-      body: JSON.stringify({ ...body, messages: llmMessages })
+      body: JSON.stringify(requestBody)
     });
 
     const upstreamContentType = response.headers.get("content-type") || "";
