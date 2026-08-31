@@ -10,7 +10,7 @@ const {
   runtimeFile,
   writeJsonAtomicSync
 } = require("./runtime_paths");
-const { isSpecialEventContent } = require("./special_events");
+const { isSpecialEventContent, isNoPushPlaceholderEvent } = require("./special_events");
 const { decideRequestAccess } = require("./network_access");
 const {
   formatDateTimeInTimeZone,
@@ -593,13 +593,25 @@ app.post("/v1/chat/completions", async (req, reply) => {
       .map(prepareMessageForLLM)
       .filter(Boolean);
 
+    // 批注 2026-08-31：修复「网关把自动唤醒占位当成回复」。
+    // 特殊事件里的「自动唤醒：本次未发送推送｜原因：…」是系统状态占位，不是 AI 对用户说的话。
+    // 把它注入对话历史，会让模型误以为回复就该长这样，于是把占位格式直接当成对用户的回复吐出来。
+    // 因此：①「本次未发送推送」的占位永远剔除，绝不注入对话（它是状态日志，不是对话内容）；
+    // ②默认不再向对话注入任何唤醒/推送特殊事件（旁路状态本就不该进对话）。
+    // 若想保留「模型知道自己刚发了推送」的连续性，可在 .env 设 INJECT_WAKE_EVENTS_TO_CHAT=true，
+    // 此时也只会注入真正推送出去的事件（占位仍被上面的过滤器挡下）。
+    const injectWakeEvents = readBooleanEnv("INJECT_WAKE_EVENTS_TO_CHAT", false);
     const oldEvents = stripPosition(
-      oldTimeline.filter(isSpecialEvent).sort((a, b) => {
-        const timeA = extractTimestampWithMemory(a, tsDB);
-        const timeB = extractTimestampWithMemory(b, tsDB);
-        if (timeA && timeB) return timeA - timeB;
-        return 0;
-      })
+      oldTimeline
+        .filter(isSpecialEvent)
+        .filter(e => !isNoPushPlaceholderEvent(normalizeContentToText(e.content)))
+        .filter(e => injectWakeEvents)
+        .sort((a, b) => {
+          const timeA = extractTimestampWithMemory(a, tsDB);
+          const timeB = extractTimestampWithMemory(b, tsDB);
+          if (timeA && timeB) return timeA - timeB;
+          return 0;
+        })
     );
 
     console.log("本次注入的特殊事件数量:", oldEvents.length);

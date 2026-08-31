@@ -6,4 +6,12 @@ function isSpecialEventContent(content) {
   return SPECIAL_EVENT_PREFIX.test(String(content || ""));
 }
 
-module.exports = { isSpecialEventContent, SPECIAL_EVENT_PREFIX };
+// 批注 2026-08-31：识别「本次未发送推送」的状态占位。
+// 这类内容（如「（2026-08-31 05:00 自动唤醒：本次未发送推送｜原因：她凌晨才睡，不吵她）」）
+// 是系统写给用户看的状态日志，不是 AI 对用户说的话。
+// 若把它当作 assistant 历史注入对话，模型会误以为回复就该长这样，从而把占位格式直接当回复输出。
+function isNoPushPlaceholderEvent(content) {
+  return /自动唤醒[:：]\s*本次未发送/.test(String(content || ""));
+}
+
+module.exports = { isSpecialEventContent, SPECIAL_EVENT_PREFIX, isNoPushPlaceholderEvent };
