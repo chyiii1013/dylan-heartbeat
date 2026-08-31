@@ -56,16 +56,29 @@ function getDiaryTimeString(date = new Date()) {
 }
 
 // 批注 2026-07-11：日记只接受模型显式输出的 [DIARY] 块，避免把普通推送内容误写进本地日记。
+// 批注 2026-07-11：日记只接受模型显式输出的 [DIARY] 块，避免把普通推送内容误写进本地日记。
+// 批注 2026-09-01：兜底剥离——模型偶尔只写 [DIARY] 漏写 [/DIARY]（闭合标签缺失/格式不规范），
+// 若只按成对匹配，漏闭合的 [DIARY] 内容会残留在 remainingText 里、被当成推送正文发给用户。
+// 这里分两遍：①先剥离成对的 [DIARY]...[/DIARY]；②再把残留的孤立 [DIARY] 到文本末尾整段剥走，
+// 确保 [DIARY] 内容绝不泄漏进推送正文。
 function extractDiaryFromResponse(text) {
   const diaryBlocks = [];
-  const remainingText = String(text || "").replace(/\[DIARY\]([\s\S]*?)\[\/DIARY\]/gi, (_, content) => {
+  let raw = String(text || "");
+  // 第一遍：成对的 [DIARY]...[/DIARY]
+  raw = raw.replace(/\[DIARY\]([\s\S]*?)\[\/DIARY\]/gi, (_, content) => {
     const diary = String(content || "").trim();
     if (diary) diaryBlocks.push(diary);
     return "";
-  }).trim();
+  });
+  // 第二遍：兜底剥离孤立 [DIARY]（漏闭合），避免泄漏进推送
+  raw = raw.replace(/\[DIARY\][\s\S]*$/i, (m) => {
+    const diary = m.replace(/^\[DIARY\]\s*/i, "").trim();
+    if (diary) diaryBlocks.push(diary);
+    return "";
+  });
   return {
     diaryContent: diaryBlocks.join("\n\n").trim(),
-    remainingText
+    remainingText: raw.trim()
   };
 }
 
