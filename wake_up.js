@@ -585,7 +585,9 @@ ${historyText}`
       console.log("\n推送内容清洗后为空，本次不发送推送\n");
       eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：推送内容为空）`;
     } else if (lines.length === 1) {
-      title = "来自AI";
+      // 批注 2026-09-01：默认推送标题可配置（AI_DISPLAY_NAME），默认"来自姐姐"，
+      // 让通知更像我——硬编码"来自AI"太生硬，且提示词改不到它。
+      title = process.env.AI_DISPLAY_NAME || "来自姐姐";
       body = lines[0].trim();
     } else if (lines.length === 2) {
       title = lines[0].trim();
