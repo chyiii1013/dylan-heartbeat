@@ -18,6 +18,7 @@ const {
   readAnchor,
   writeAnchor
 } = require("./last_user_anchor");
+const { findNewestUserIndex, selectTimelineWindow } = require("./timeline_window");
 const { decideRequestAccess } = require("./network_access");
 const {
   formatDateTimeInTimeZone,
@@ -236,7 +237,10 @@ function loadTimeline() {
 function saveTimeline(messages) {
   const sp = messages.find(m => m.role === "system");
   const nonSP = messages.filter(m => m.role !== "system");
-  const trimmed = nonSP.slice(-49);
+  // 批注 2026-09-17：以前是 slice(-49) 一刀切。事件总排在对话后面又会一天天攒，
+  // 攒满 49 条那天整段对话就被挤了出去（现场：你 0 条 / 我 49 条）。
+  // 交给 timeline_window 分开算额度：对话至少留 MAX_REAL 条，事件占剩下的。
+  const trimmed = selectTimelineWindow(nonSP, { isSpecial: isSpecialEvent });
   const final = sp ? [sp, ...trimmed] : trimmed;
   writeJsonAtomicSync(TIMELINE_FILE, final);
 }
@@ -413,7 +417,15 @@ function buildTimeline(kelivoMessages, tsDB) {
         break;
       }
     }
-    if (!inserted) merged.push(event);
+    if (!inserted) {
+      // 批注 2026-09-17：真实消息没有可解析时间（客户端注入的是中文日期）时，
+      // 事件插不进去。以前一律 push 到末尾，于是 49 条事件全压在对话后面，
+      // 再被 slice(-49) 一剪，对话就没了。改为插到「最新一条用户消息」之前：
+      // 事件本来就发生在对话之间，而时间线必须以她的最后一句话收尾。
+      const newestUserIndex = findNewestUserIndex(merged);
+      if (newestUserIndex >= 0) merged.splice(newestUserIndex, 0, event);
+      else merged.push(event);
+    }
   }
 
   const seen = new Set();
