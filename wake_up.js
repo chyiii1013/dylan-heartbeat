@@ -3,6 +3,11 @@ const fs = require("fs");
 const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
 const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
+const {
+  lastUserTimeFromMessages,
+  pickLatestDate,
+  readAnchor
+} = require("./last_user_anchor");
 const { parseChatCompletionResponse } = require("./upstream_response");
 const {
   formatDateTimeInTimeZone,
@@ -15,6 +20,9 @@ const {
 // 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
 const DATA_DIR = ensureDataDir();
 const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
+// 批注 2026-09-17：网关每次存盘都刷新这份锚点；时间线被重建丢了 user 消息时，
+// 靠它兜底，不会再「未找到用户时间」。
+const LAST_USER_TIME_PATH = runtimeFile("last_user_time.json");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -25,6 +33,8 @@ const DIARY_DIR_NAME = process.env.DIARY_DIR || "diary";
 const DIARY_DIR_PATH = runtimeDirectory(DIARY_DIR_NAME, "diary");
 const PUSH_TIMEOUT_MS = readPositiveTimeout("PUSH_TIMEOUT_MS", 15_000);
 const WAKE_UPSTREAM_TIMEOUT_MS = readPositiveTimeout("WAKE_UPSTREAM_TIMEOUT_MS", 300_000);
+// 批注 2026-09-17：心跳独立于检查间隔，默认一分钟一次。
+const HEARTBEAT_INTERVAL_MS = readPositiveTimeout("HEARTBEAT_INTERVAL_MS", 60_000);
 
 function readPositiveTimeout(key, fallback) {
   const value = Number(process.env[key]);
@@ -354,17 +364,18 @@ function parseTimelineTimestamp(value) {
 }
 
 function getLastUserTime(messages) {
-  const reversed = [...messages].reverse();
-  for (const msg of reversed) {
-    if (msg.role === "user") {
-      const content = normalizeContentToText(msg.content);
-      // 批注 2026-07-15：兼容 Kelivo 时间前缀 "YYYY-MM-DDHH:mm"；
-      // 旧的 "YYYY-MM-DD HH:mm" 仍然可用，避免无空格时间导致 wake-up 误判没有用户时间。
-      const parsed = parseTimelineTimestamp(content);
-      if (parsed) return parsed;
-    }
-  }
-  return null;
+  // 批注 2026-09-17：两条路一起走。
+  // ① 时间线里倒着找最新一条能挖出时间的 user 消息；
+  // ② 读网关写下的锚点文件。
+  // 取更晚的那个：锚点比时间线旧就听时间线的，时间线被请求重建、user 被抹掉时
+  // 就由锚点兜住。以前只有 ①，断链之后每一轮都卡死在这里。
+  const fromTimeline = lastUserTimeFromMessages(
+    messages,
+    parseTimelineTimestamp,
+    msg => normalizeContentToText(msg.content)
+  );
+  const fromAnchor = readAnchor(LAST_USER_TIME_PATH);
+  return pickLatestDate(fromTimeline, fromAnchor);
 }
 
 function stripPosition(messages) {
@@ -422,7 +433,10 @@ async function runWakeUp() {
 
   const lastUserTime = getLastUserTime(messages);
   if (!lastUserTime) {
-    console.log("未找到用户时间");
+    // 批注 2026-09-17：把体检数据一起打出来，下一次不用再翻文件才看得出断在哪。
+    const userCount = messages.filter(msg => msg.role === "user").length;
+    const anchorState = fs.existsSync(LAST_USER_TIME_PATH) ? "有但读不出" : "不存在";
+    console.log(`未找到用户时间（时间线 ${messages.length} 条 / user ${userCount} 条，锚点文件${anchorState}）`);
     return;
   }
 
@@ -636,12 +650,14 @@ function getCheckIntervalMs() {
   return getCheckIntervalMinutes(new Date()) * 60 * 1000;
 }
 
+async function sendHeartbeat() {
+  try {
+    await fetch(HEARTBEAT_URL, { method: "POST" });
+  } catch {}
+}
+
 async function scheduleNextCheck() {
   try {
-    // 发送心跳
-    try {
-      await fetch(HEARTBEAT_URL, { method: "POST" });
-    } catch {}
     await runWakeUp();
   } catch (err) {
     console.error("唤醒检查出错:", err);
@@ -653,6 +669,12 @@ async function scheduleNextCheck() {
 // 启动第一次检查（延迟10秒）
 setTimeout(scheduleNextCheck, 10_000);
 
+// 批注 2026-09-17：心跳从检查循环里拆出来，独立按分钟上报。
+// 以前它跟着检查间隔走（白天一小时才跳一次），而网关重启会把内存里的心跳清空，
+// 于是管理页显示「离线或未启动」，把一个活着的 wake-up 说成死的。
+setTimeout(sendHeartbeat, 5_000);
+setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+
 console.log("\n==================================");
 console.log("Dylan Heartbeat Runtime 已启动（动态间隔）");
 console.log(JSON.stringify({
@@ -663,6 +685,7 @@ console.log(JSON.stringify({
   target_key_configured: Boolean(process.env.TARGET_API_KEY),
   model_configured: Boolean(process.env.MODEL_NAME),
   push_provider_configured: Boolean(process.env.BARK_KEY || process.env.NTFY_TOPIC),
+  heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
   data_dir_ready: fs.existsSync(DATA_DIR)
 }));
 console.log("==================================\n");

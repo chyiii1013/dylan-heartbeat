@@ -882,6 +882,7 @@ function pageScript(context) {
 function renderAdminPage(context) {
   const cfg = context.config || {};
   const diary = context.diary || { dates: [], today: "", latest: null };
+  const timeline = context.timeline || {};
   const draftCount = diary.dates.length;
 
   return `<!DOCTYPE html>
@@ -955,6 +956,16 @@ function renderAdminPage(context) {
 
     <!-- ========== 设置 ========== -->
     <div class="tab-panel" id="panel-settings">
+      <div class="status">
+        <p><strong>时间线体检</strong></p>
+        <p>消息 ${timeline.count || 0} 条 ／ 你 ${timeline.users || 0} ／ 我 ${timeline.assistants || 0} ／ 系统 ${timeline.systems || 0}</p>
+        <p>能读出时间的你说的话：${timeline.readableUsers || 0} 条</p>
+        <p>最后一条你的消息：${escapeHtml(timeline.lastUserTime || "没有")}</p>
+        <p>唤醒锚点：${escapeHtml(timeline.anchor || "没有")}</p>
+        <p>时间线更新于 ${escapeHtml(timeline.updatedAt || "—")} ／ 锚点更新于 ${escapeHtml(timeline.anchorUpdatedAt || "—")}</p>
+        <div class="hint">自动唤醒靠「最后一条你的消息」判断你多久没说话。这个数字变成 0、锚点变成「没有」的时候，唤醒会卡在日志里那句「未找到用户时间」，既不推送也不写日记。</div>
+      </div>
+
       <div class="presets-box">
         <h3>预设方案</h3>
         <div class="preset-list" id="presetList"></div>

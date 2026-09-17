@@ -11,6 +11,13 @@ const {
   writeJsonAtomicSync
 } = require("./runtime_paths");
 const { isSpecialEventContent, isNoPushPlaceholderEvent } = require("./special_events");
+const {
+  hasParseableTimestamp,
+  hasRealUserContent,
+  lastUserTimeFromMessages,
+  readAnchor,
+  writeAnchor
+} = require("./last_user_anchor");
 const { decideRequestAccess } = require("./network_access");
 const {
   formatDateTimeInTimeZone,
@@ -66,6 +73,8 @@ const IS_RAILWAY_RUNTIME = Boolean(
 const DATA_DIR = ensureDataDir();
 const TIMELINE_FILE = runtimeFile("enhanced_messages.json");
 const TIMESTAMP_DB_FILE = runtimeFile("message_timestamps.json");
+// 批注 2026-09-17：唤醒锚点独立成文件，wake_up 不再只靠从时间线正文挖时间戳。
+const LAST_USER_TIME_FILE = runtimeFile("last_user_time.json");
 // 批注 2026-07-17：管理页保存 .env 后要让 PM2 刷新进程环境；保留原进程名，
 // 只补 --update-env，避免用户改完推送配置却继续运行旧值。
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up --update-env";
@@ -230,6 +239,60 @@ function saveTimeline(messages) {
   const trimmed = nonSP.slice(-49);
   const final = sp ? [sp, ...trimmed] : trimmed;
   writeJsonAtomicSync(TIMELINE_FILE, final);
+}
+
+// ========================
+// 时间线体检（给管理页看）
+// ========================
+// 批注 2026-09-17：唤醒是靠「最后一条用户消息」判断用户多久没说话的。
+// 用户消息为 0 时唤醒会永久卡死，而这件事以前只在 pm2 日志里看得见。
+// 把体检结果直接摆到管理页，一眼就能看出链子有没有断。
+function readTimelineStats() {
+  const stats = {
+    count: 0,
+    users: 0,
+    assistants: 0,
+    systems: 0,
+    readableUsers: 0,
+    lastUserTime: null,
+    anchor: null,
+    anchorUpdatedAt: null,
+    updatedAt: null
+  };
+
+  try {
+    const list = loadTimeline();
+    stats.count = list.length;
+    for (const msg of list) {
+      const text = normalizeContentToText(msg.content);
+      if (msg.role === "user") {
+        stats.users += 1;
+        if (hasParseableTimestamp(text)) stats.readableUsers += 1;
+      } else if (msg.role === "assistant") {
+        stats.assistants += 1;
+      } else if (msg.role === "system") {
+        stats.systems += 1;
+      }
+    }
+    const lastUser = lastUserTimeFromMessages(
+      list,
+      parseTimestampLabel,
+      msg => normalizeContentToText(msg.content)
+    );
+    if (lastUser) stats.lastUserTime = formatDateTimeInTimeZone(lastUser, TIME_ZONE);
+  } catch {}
+
+  if (fs.existsSync(TIMELINE_FILE)) {
+    stats.updatedAt = formatDateTimeInTimeZone(fs.statSync(TIMELINE_FILE).mtime, TIME_ZONE);
+  }
+
+  const anchorDate = readAnchor(LAST_USER_TIME_FILE);
+  if (anchorDate) stats.anchor = formatDateTimeInTimeZone(anchorDate, TIME_ZONE);
+  if (fs.existsSync(LAST_USER_TIME_FILE)) {
+    stats.anchorUpdatedAt = formatDateTimeInTimeZone(fs.statSync(LAST_USER_TIME_FILE).mtime, TIME_ZONE);
+  }
+
+  return stats;
 }
 
 // ========================
@@ -407,16 +470,18 @@ function buildTimeline(kelivoMessages, tsDB) {
 // 模型的内容。
 function ensureLastUserHasTimestamp(messages, now = new Date()) {
   // 与 wake_up.js parseTimelineTimestamp 等价的可解析判定
-  const tsRegex = /（?\s*\d{4}([-/])\d{1,2}\1\d{1,2}(?:[ T]?)\d{1,2}[:：]\d{2}/;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== "user") continue;
     const text = normalizeContentToText(m.content);
-    if (tsRegex.test(text)) break; // 已带可解析时间戳，无需补
-    // 不含 → 补一个英文时间戳前缀，作为 wake_up 的最新锚点
+    const parsed = parseTimestampLabel(text);
+    // 批注 2026-09-17：返回值就是这个锚点——已带可解析时间戳就用它，
+    // 否则补一个并返回当前时刻。补不出任何 user 消息则返回 null。
+    if (parsed) return parsed;
     m.content = `${formatDateTimeInTimeZone(now, TIME_ZONE)} ${text}`.trim();
-    break;
+    return now;
   }
+  return null;
 }
 
 // ========================
@@ -616,10 +681,31 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }
     if (tsDBDirty) saveTimestampDB(tsDB);
 
-    const finalTimeline = buildTimeline(kelivoMessages, tsDB);
-    // 批注 2026-08-31：存盘前给最新 user 消息兜底补英文时间戳，治本唤醒误判。
-    ensureLastUserHasTimestamp(finalTimeline);
-    saveTimeline(finalTimeline);
+    // 批注 2026-09-17：护栏——请求里没有「用户真的说了话」，就不是一轮对话，
+    // 不许拿它重建时间线。以前一次只有 <system> 注入（或纯工具续写）的请求，
+    // 就能把历史 user 消息整体抹掉，wake_up 从此永远「未找到用户时间」，
+    // 不推送、不写日记，而且不会自愈。
+    const incomingUserTexts = kelivoMessages
+      .filter(msg => msg.role === "user")
+      .map(msg => normalizeContentToText(msg.content));
+
+    if (!hasRealUserContent(incomingUserTexts)) {
+      console.log(JSON.stringify({
+        event: "timeline_rebuild_skipped",
+        reason: "no_real_user_message",
+        incoming: summarizeMessagesForLog(kelivoMessages)
+      }));
+    } else {
+      const finalTimeline = buildTimeline(kelivoMessages, tsDB);
+      // 批注 2026-08-31：存盘前给最新 user 消息兜底补英文时间戳，治本唤醒误判。
+      const lastUserTime = ensureLastUserHasTimestamp(finalTimeline);
+      saveTimeline(finalTimeline);
+      // 批注 2026-09-17：顺手把锚点写进独立文件。时间线再怎么被玩家端重建，
+      // 这份「用户最后说话的时刻」都不会跟着丢。
+      if (lastUserTime) {
+        writeAnchor(LAST_USER_TIME_FILE, lastUserTime, { source: "chat" });
+      }
+    }
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
     // 如上游不支持图片，可设置 MULTIMODAL_MODE=text 退回文本占位。
@@ -941,6 +1027,7 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
     runtimeConfigNotice,
     authToken,
     presets: loadPresets(),
+    timeline: readTimelineStats(),
     diary: {
       dates: diaryFiles.map(file => file.date),
       today: diaryDateInTimeZone(),
