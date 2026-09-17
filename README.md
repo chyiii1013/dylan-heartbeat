@@ -70,6 +70,8 @@ Bark / ntfy 推送 → 你的手机
 | 文件 | 作用 |
 |------|------|
 | `server.js` | 主 Gateway。转发请求、维护时间线、注入推送事件、提供管理页面。 |
+| `admin_page.js` | 管理页模板。日记/设置两个 tab、日历、备份导入的前端逻辑都在这里。 |
+| `diary_store.js` | 日记文件的列举、读取、zip 备份与导入（含冲突备份），可单独测试。 |
 | `wake_up.js` | 自动唤醒 Runtime。按间隔唤醒 AI，生成推送或静默，发送到手机，写入时间线。 |
 | `enhanced_messages.json` | **AI 世界时间线**。SP + 真实对话 + 推送事件。不是日志，是 AI 的当前世界。 |
 | `message_timestamps.json` | **时间戳记忆库**。通过内容指纹记录每条消息的原始时间，找回历史消息时间。 |
@@ -127,6 +129,18 @@ node wake_up.js
 - 最后一定要重启 `gateway` 和 `wake-up`
 
 ---
+
+## 📋 更新日志（2026-09-17）
+
+- 🗂️ 管理页拆成「日记 / 设置」两个 tab：日记区不再一次性渲染最近 20 篇全文（那是页面要划很久才能到底的原因），设置表单从此在第一屏。
+- 📅 日记默认只显示当天，今天还没写就退回最新一篇；点「日历」用月历翻看，有日记的日子会打点，点一下展开那天。正文按天按需拉取，页面体积不再随日记数量增长。
+- 💾 新增「备份到本地」：把 `DIARY_DIR` 下的全部日记打包成一个 `.zip` 下载。日记在 `.gitignore` 里、不随 git 走，这个包是唯一的异地副本手段。
+- 📥 新增「导入备份」：支持 `.zip`（含第三方工具压缩的包）或单个 `YYYY-MM-DD.md`。同一天已有日记时，旧文件先复制为 `.bak-YYYYMMDD-HHMMSS` 再原子写入，不删任何东西，随时可回滚；文件名不合规、内容为空的条目只跳过并报告原因。
+- 🧩 zip 读写自己实现（Node 内置 `zlib`），**不新增任何第三方依赖**，Termux 部署不需要再 `npm install`。
+- ⚙️ 管理页补齐原先只能手改 `.env` 的配置：思考模式（`GATEWAY_CHAT_REASONING` / `WAKE_REASONING`）、推送通道与 ntfy 全套、推送标题与称呼（`AI_DISPLAY_NAME` / `USER_DISPLAY_NAME`）、日记开关、`ALLOW_PUBLIC_API`、`TIME_ZONE`、`MULTIMODAL_MODE` 与各类超时。
+- 🔒 有意**不**放进管理页的变量：`RESTART_COMMAND`（等于给网页一个远程命令执行入口）、`ADMIN_USER` / `ADMIN_PASSWORD`（改错会把自己锁在门外）、`DATA_DIR` / `DIARY_DIR`（改了日记看起来会"消失"）、`PORT` / `GATEWAY_BASE_URL`（改错服务起不来）。同时保存时不再把管理员账号回写成空值。
+- 🏷️ 唤醒相关字段标出「需重启」：`wake_up.js` 是独立进程，只在启动时读一次 `.env`，不重启不生效。设置页新增「保存并重启」。
+- 🧱 管理页模板搬到 `admin_page.js`，日记文件读写搬到 `diary_store.js`，两者都可单独测试。
 
 ## 📋 更新日志（2026-08-10）
 
@@ -321,14 +335,29 @@ http://你的电脑局域网IP:3000/v1/chat/completions
 
 ## 🖥️ 管理页面（Web 控制台）
 
-启动 Gateway 后，访问 `http://你的IP:3000/admin` 即可进入管理页面。
+启动 Gateway 后，访问 `http://你的IP:3000/admin` 即可进入管理页面。使用 `.env` 中设置的 `ADMIN_USER` 和 `ADMIN_PASSWORD` 登录（HTTP Basic Auth）。
 
-- 使用 `.env` 中设置的 `ADMIN_USER` 和 `ADMIN_PASSWORD` 登录
+页面分成两个 tab：
+
+**日记**
+
+- 默认显示今天的日记；今天还没写就退回最新一篇
+- 点「日历」展开月历，有日记的日子会打点，点某天看那天的内容
+- 「备份到本地」把 `DIARY_DIR` 下全部日记打包成一个 `.zip` 下载
+- 「导入备份」支持 `.zip` 或单个 `YYYY-MM-DD.md`；同一天已有日记时先存 `.bak-时间戳` 再写入
+
+**设置**
+
 - 实时查看 Gateway 和自动唤醒的运行状态
-- 在线修改 API 地址、Key、模型、Bark Key 等基础配置
-- **一键重启服务**（需配合 pm2 使用，默认执行 `pm2 restart gateway wake-up --update-env`）
+- API 地址、Key、模型、推送渠道与推送文案
+- 思考模式、日记开关、唤醒节奏、天气、时区与超时
+- **一键重启服务**（也可用「保存并重启」一步到位）
 
-如果你的 pm2 进程名不同，请在 `.env` 中修改：
+标了「需重启」的字段，保存后必须重启才生效——`wake_up.js` 是独立进程，只在启动时读一次 `.env`，gateway 里现读的配置不会带到它那边。
+
+下列变量**故意没有**放进管理页，需要手改 `.env`：`RESTART_COMMAND`（放上页面等于开放一个远程命令执行入口）、`ADMIN_USER` / `ADMIN_PASSWORD`（改错就把自己锁在门外）、`DATA_DIR` / `DIARY_DIR`（改了路径日记会看起来"消失"）、`PORT` / `GATEWAY_BASE_URL`（改错服务起不来）。
+
+如果你使用 pm2，一键重启默认执行 `pm2 restart gateway wake-up --update-env`。进程名不同请修改：
 
 ```env
 RESTART_COMMAND=pm2 restart 你的gateway进程名 你的wake进程名 --update-env
@@ -473,6 +502,27 @@ DIARY_ENABLED=false
 ```
 
 `[DIARY]...[/DIARY]` 可以和推送内容同时出现；如果模型只写日记、不写推送，系统会记录为“本次未发送推送｜原因：只写日记”。
+
+### 备份与导入
+
+日记在 `.gitignore` 里，**不随 git 同步**，所以本地那一份就是唯一一份。管理页的「日记」tab 提供：
+
+- **备份到本地**：把 `DIARY_DIR` 下全部日记打包成 `heartbeat-diary-YYYYMMDD-HHMMSS.zip` 下载，包内按日期从旧到新排列，电脑或手机都能直接解开看。
+- **导入备份**：可以选一个 `.zip`（自己导出的、或第三方工具压缩的都行），也可以一次选多个 `YYYY-MM-DD.md`。
+
+导入规则：
+
+| 情况 | 处理 |
+|------|------|
+| 那天还没有日记 | 直接写入 |
+| 那天已经有日记 | 先把旧文件复制成 `YYYY-MM-DD.md.bak-YYYYMMDD-HHMMSS`，再原子替换新内容 |
+| 文件名不是 `YYYY-MM-DD.md` | 跳过，并在页面上报告是哪个文件、为什么跳过 |
+| 内容为空 | 跳过并报告 |
+| 备份里同一天出现多次 | 只保留最后一份 |
+
+备份文件不会出现在日记列表里（列表只认严格的 `YYYY-MM-DD.md`），也不会被再次打包进去。想回滚某一天，去 `DIARY_DIR` 找到对应的 `.bak-` 文件，把名字改回去即可。
+
+zip 的读写由项目自己实现（Node 内置 `zlib`），没有引入压缩库，因此升级这个功能不需要额外 `npm install`。
 
 ---
 
