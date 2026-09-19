@@ -9,6 +9,7 @@ const {
   readAnchor
 } = require("./last_user_anchor");
 const { parseChatCompletionResponse } = require("./upstream_response");
+const { splitToolCallText } = require("./tool_call_guard");
 const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
@@ -33,8 +34,19 @@ const DIARY_DIR_NAME = process.env.DIARY_DIR || "diary";
 const DIARY_DIR_PATH = runtimeDirectory(DIARY_DIR_NAME, "diary");
 const PUSH_TIMEOUT_MS = readPositiveTimeout("PUSH_TIMEOUT_MS", 15_000);
 const WAKE_UPSTREAM_TIMEOUT_MS = readPositiveTimeout("WAKE_UPSTREAM_TIMEOUT_MS", 300_000);
-// 批注 2026-09-17：心跳独立于检查间隔，默认一分钟一次。
+// 批注 2026-09-19：心跳独立于检查间隔，默认一分钟一次。
 const HEARTBEAT_INTERVAL_MS = readPositiveTimeout("HEARTBEAT_INTERVAL_MS", 60_000);
+
+// 批注 2026-09-19：后台唤醒跑在网关/Termux 上，手里没有工具，但注入的 system prompt
+// 里带着 RikkaHub workspace 的用法（含 DSML 工具调用格式），模型会照着去调
+// `workspace_shell`，那段标记会原样变成推送到她手机上的内容。这条硬规矩永远钉在
+// 系统消息的最末尾，压过前面所有关于工具的说明。
+const WAKE_ENV_GUARD = [
+  "## 硬规矩（这条压过前面所有关于工具的说明）",
+  "这次唤醒没有工具：没有 workspace、没有 termux、没有记忆库检索，我调不了任何东西。",
+  "不要输出工具调用标记（`<||DSML||...>` 这类）、不要写命令、不要写「我去查一下」。",
+  "我的输出会原样变成她手机上的推送——所以我只有一件事可做：用我自己的话，对她说我想说的话。"
+].join("\n");
 
 function readPositiveTimeout(key, fallback) {
   const value = Number(process.env[key]);
@@ -466,6 +478,9 @@ async function runWakeUp() {
       if (content.includes("## Memories")) {
         content = content.split("## Memories")[0];
       }
+      // 批注 2026-09-19：历史里如果混进过工具调用标记（那两条推错的），不要再喂回给模型——
+      // 留着它就是在教它下次继续调工具。
+      content = splitToolCallText(content).text;
       return `[${role}] ${content}`;
     })
     .join("\n\n");
@@ -478,7 +493,9 @@ async function runWakeUp() {
   const wakeMessages = [
     {
       role: "system",
-      content: [wakePrompt, cleanSP].filter(Boolean).join("\n\n")
+      // 批注 2026-09-19：WAKE_ENV_GUARD 必须排在最后——它要压过 cleanSP 里那段
+      // RikkaHub workspace（含 DSML 工具调用格式）的说明。
+      content: [wakePrompt, cleanSP, WAKE_ENV_GUARD].filter(Boolean).join("\n\n")
     },
     {
       // 批注 2026-07-15：Claude/部分 New API 适配器会把 system 抽成独立字段；
@@ -550,16 +567,26 @@ ${historyText}`
   console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
 
   const diaryResult = extractDiaryFromResponse(rawAiText);
-  const diarySaved = appendDiaryEntry(diaryResult.diaryContent);
-  const aiText = diaryResult.remainingText;
+  // 批注 2026-09-19：模型偶尔会去调工具（被 system prompt 里那段 workspace 用法带的）。
+  // 工具调用标记绝不能变成推送内容，也不能进日记——标记之后整块丢掉。
+  const diaryGuard = splitToolCallText(diaryResult.diaryContent);
+  const bodyGuard = splitToolCallText(diaryResult.remainingText);
+  const toolCallDetected = bodyGuard.hadToolCall || diaryGuard.hadToolCall;
+  if (toolCallDetected) {
+    console.log("\n模型输出了工具调用标记，已剥掉（后台唤醒没有工具）\n");
+  }
+  const diarySaved = diaryGuard.text ? appendDiaryEntry(diaryGuard.text) : false;
+  const aiText = bodyGuard.text;
 
   let eventContent;
 
   if (!aiText) {
     console.log("\nAI 未返回推送内容，本次不发送推送\n");
-    eventContent = diarySaved
-      ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：只写日记）`
-      : `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：模型空回复）`;
+    eventContent = toolCallDetected
+      ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：模型想去调工具，没有想说的话）`
+      : diarySaved
+        ? `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：只写日记）`
+        : `（${getLocalTimeString()} 自动唤醒：本次未发送推送｜原因：模型空回复）`;
   // 判断 AI 是否明确要静默
   } else if (aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/)) {
     const noActionMatch = aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/);
